@@ -14,13 +14,6 @@ import (
 var PERM_DEL_FLAG = "--drive-use-trash=false"
 
 func Dis_rm(arg []string, reSignal bool) (err error) {
-	//rclonePath := GetRcloneDirPath()
-
-	//remote->local sync
-	//err = dis_config.SyncAnyRemoteToLocal(rclonePath)
-	//if err != nil {
-	//	return err
-	//}
 
 	originalFileName := arg[0]
 	var distributedFileArray []DistributedFile
@@ -67,10 +60,6 @@ func Dis_rm(arg []string, reSignal bool) (err error) {
 	}
 
 	fmt.Printf("Successfully deleted all parts of %s and updated metadata.\n", originalFileName)
-	//err = dis_config.SyncAllLocalToRemote(rclonePath)
-	//if err != nil {
-	//	return err
-	//}
 
 	return nil
 }
@@ -108,7 +97,6 @@ func startRmFileGoroutine(originalFileName string, distributedFileArray []Distri
 		go func(info DistributedFile) {
 			defer wg.Done()
 
-			// Info.Remote.Name:Distribution/info.DistributedFile
 			hashedFileName, err := CalculateHash(info.DistributedFile)
 			if err != nil {
 				errCh <- fmt.Errorf("failed to calculate hash %v", err)
