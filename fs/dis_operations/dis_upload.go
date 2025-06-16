@@ -118,11 +118,6 @@ func Dis_Upload(args []string, reSignal bool, loadBalancer LoadBalancerType) err
 	}
 
 	fmt.Println("Completed Dis_Upload!")
-	//local->remote sync
-	// err = dis_config.SyncAllLocalToRemote(rclonePath)
-	// if err != nil {
-	// 	return err
-	// }
 
 	return nil
 }
@@ -153,7 +148,7 @@ func prepareUpload(absolutePath string) (hashNameMap map[string]string, distribu
 		return nil, nil, err
 	}
 
-	// get Distributed info	해야함
+	// get Distributed info
 	for idx, source := range dis_names {
 		dis_fileName := filepath.Base(source)
 

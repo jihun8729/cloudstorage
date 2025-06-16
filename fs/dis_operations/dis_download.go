@@ -35,14 +35,6 @@ var copyCommandDefinitionForDown = &cobra.Command{
 
 func Dis_Download(args []string, reSignal bool) (err error) {
 
-	//rclonePath := GetRcloneDirPath()
-
-	//remote->local sync
-	// err = dis_config.SyncAnyRemoteToLocal(rclonePath)
-	// if err != nil {
-	// 	return err
-	// }
-
 	originalFileName := filepath.Base(args[0])
 	_, err = GetFileInfoStruct(originalFileName)
 	if err != nil {
@@ -167,10 +159,6 @@ func startDownloadFileGoroutine_Worker(distributedFileInfos []DistributedFile, o
 	close(jobs) // Close channel to signal workers
 	wg.Wait()   // Wait for all workers to finish
 
-	// if len(errs) > 0 {
-	// 	return fmt.Errorf("errors occurred during download: %v", errs)
-	// }
-
 	return nil
 }
 
@@ -197,10 +185,6 @@ func startDownloadFileGoroutine(distributedFileInfos []DistributedFile, original
 	}
 
 	wg.Wait()
-
-	// if len(errs) > 0 {
-	// 	return fmt.Errorf("errors occurred during download: %v", errs)
-	// }
 
 	return nil
 }
