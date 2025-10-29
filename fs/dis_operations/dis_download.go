@@ -3,9 +3,11 @@ package dis_operations
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +36,11 @@ var copyCommandDefinitionForDown = &cobra.Command{
 }
 
 func Dis_Download(args []string, reSignal bool) (err error) {
+	mode := ""
+
+	if len(args) >= 3 {
+		mode = args[2] // 세 번째 파라미터 (예: "optimize")
+	}
 
 	originalFileName := filepath.Base(args[0])
 	_, err = GetFileInfoStruct(originalFileName)
@@ -60,6 +67,53 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 		if err != nil {
 			return err
 		}
+	}
+	if mode == "optimize" {
+		fmt.Println("🚀 Optimization mode: Pre-planned optimal download enabled")
+
+		fileInfo, err := GetFileInfoStruct(originalFileName)
+		if err != nil {
+			return err
+		}
+
+		// ① datamap.json 정보
+		dataShards := fileInfo.Shard
+		remoteShardCount := fileInfo.RemoteShardCount
+
+		// ② loadbalancer.json 정보
+		jsonFilePath := getLoadBalancerJsonFilePath()
+		lbInfo, err := readJSON(jsonFilePath)
+		if err != nil {
+			return err
+		}
+
+		// 평균 다운로드 속도
+		avgDown := make(map[string]float64)
+		for name, info := range lbInfo.RemoteInfos {
+			parts := strings.Split(name, "|")
+			base := parts[0]
+			avgDown[base] = info.AvgDownThroughput
+		}
+
+		// ③ remoteShardCount 이름 정규화
+		normalizedOwned := make(map[string]int)
+		for key, val := range remoteShardCount {
+			parts := strings.Split(key, "|")
+			base := parts[0]
+			normalizedOwned[base] = val
+		}
+
+		// ④ 최적 분배 계산
+		optimalPlan := findOptimalDownloadPlan(avgDown, normalizedOwned, dataShards, 16.0)
+		fmt.Printf("📊 Optimal Download Plan: %v\n", optimalPlan)
+
+		// ⑤ plan에 맞는 shard만 선택
+		filtered := selectShardsByPlan(distributedFileInfos, optimalPlan)
+		fmt.Printf("🎯 Applying optimized selection: %d shards retained out of %d\n",
+			len(filtered), len(distributedFileInfos))
+
+		distributedFileInfos = filtered
+
 	}
 
 	start := time.Now()
@@ -117,6 +171,59 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 	return nil
 }
 
+type DownloadPlan map[string]int
+
+// findOptimalDownloadPlan - dataShards 개를 각 remote에 어떻게 나눌지 결정
+func findOptimalDownloadPlan(remotes map[string]float64, owned map[string]int, dataShards int, shardSizeMB float64) DownloadPlan {
+	keys := make([]string, 0, len(remotes))
+	for k := range remotes {
+		keys = append(keys, k)
+	}
+
+	bestPlan := make(DownloadPlan)
+	bestTime := math.MaxFloat64
+
+	// 재귀 또는 중첩 for문으로 조합 탐색 (3개 remote 기준)
+	if len(keys) == 3 {
+		a, b, c := keys[0], keys[1], keys[2]
+		for i := 0; i <= owned[a]; i++ {
+			for j := 0; j <= owned[b]; j++ {
+				k := dataShards - i - j
+				if k < 0 || k > owned[c] {
+					continue
+				}
+				tA := (float64(i) * shardSizeMB * 8) / remotes[a]
+				tB := (float64(j) * shardSizeMB * 8) / remotes[b]
+				tC := (float64(k) * shardSizeMB * 8) / remotes[c]
+				makespan := math.Max(tA, math.Max(tB, tC))
+				if makespan < bestTime {
+					bestTime = makespan
+					bestPlan[a] = i
+					bestPlan[b] = j
+					bestPlan[c] = k
+				}
+			}
+		}
+	}
+	return bestPlan
+}
+
+func selectShardsByPlan(files []DistributedFile, plan DownloadPlan) []DistributedFile {
+	result := []DistributedFile{}
+	count := make(map[string]int)
+	for _, f := range files {
+		// 🔧 Remote.Name 에는 대부분 "gdrive|drive" 형태로 저장됨
+		parts := strings.Split(f.Remote.Name, "|")
+		rname := parts[0] // "gdrive"만 사용
+
+		if plan[rname] > count[rname] {
+			result = append(result, f)
+			count[rname]++
+		}
+	}
+	return result
+}
+
 func startDownloadFileGoroutine_Worker(distributedFileInfos []DistributedFile, originalFileName string, workerCount int) (err error) {
 	shardDir, err := reedsolomon.GetShardDir()
 	if err != nil {
@@ -162,33 +269,6 @@ func startDownloadFileGoroutine_Worker(distributedFileInfos []DistributedFile, o
 	return nil
 }
 
-func startDownloadFileGoroutine(distributedFileInfos []DistributedFile, originalFileName string) (err error) {
-	shardDir, err := reedsolomon.GetShardDir()
-	if err != nil {
-		return err
-	}
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var errs []error
-
-	for _, fileInfo := range distributedFileInfos {
-		wg.Add(1)
-		go func(fileInfo DistributedFile) {
-			defer wg.Done()
-			if err := downloadFile(fileInfo, shardDir, originalFileName, &mu, &errs); err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-			}
-		}(fileInfo)
-	}
-
-	wg.Wait()
-
-	return nil
-}
-
 func downloadFile(fileInfo DistributedFile, shardDir, originalFileName string, mu *sync.Mutex, errs *[]error) error {
 	startTime := time.Now()
 
@@ -222,14 +302,14 @@ func downloadFile(fileInfo DistributedFile, shardDir, originalFileName string, m
 
 	// Calculate throughput
 	throughput := float64(downloadedFile.Size()) / elapsedTime.Seconds()
-	throughputKbps := throughput * 8 / 1e3
+	throughputMbps := throughput * 8 / 1e6
 
 	if err := ConvertFileNameForDo(hashedFileName, fileInfo.DistributedFile); err != nil {
 		return fmt.Errorf("ConvertFileNameForDo for %s: %w", fileInfo.DistributedFile, err)
 	}
 
 	// Update remote info
-	err = updateRemoteInfo_Down(originalFileName, fileInfo, throughputKbps, mu)
+	err = updateRemoteInfo_Down(originalFileName, fileInfo, throughputMbps, mu)
 	if err != nil {
 		return err
 	}
@@ -237,7 +317,7 @@ func downloadFile(fileInfo DistributedFile, shardDir, originalFileName string, m
 	return nil
 }
 
-func updateRemoteInfo_Down(originalFileName string, shardInfo DistributedFile, throughputKbps float64, mu *sync.Mutex) error {
+func updateRemoteInfo_Down(originalFileName string, shardInfo DistributedFile, throughputMbps float64, mu *sync.Mutex) error {
 	mu.Lock()
 	err := UpdateDistributedFile_CheckFlag(originalFileName, shardInfo.DistributedFile, true)
 	if err != nil {
@@ -245,7 +325,7 @@ func updateRemoteInfo_Down(originalFileName string, shardInfo DistributedFile, t
 		return fmt.Errorf("UpdateDistributedFileCheckFlag error: %v", err)
 	}
 	err = UpdateRemoteInfo(shardInfo.Remote, func(b *RemoteInfo) {
-		b.UpdateThroughput(throughputKbps, 1)
+		b.UpdateThroughput(throughputMbps, 1)
 	})
 	mu.Unlock()
 	if err != nil {
