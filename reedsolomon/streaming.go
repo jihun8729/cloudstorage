@@ -14,9 +14,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	v2 "github.com/flew-software/filecrypt"
 	"github.com/rclone/rclone/fs/config"
@@ -88,24 +90,21 @@ func DeleteShardDir() {
 }
 
 func calculateShardsNum(filename string) {
-	const minSize = 10 * 1024 * 1024
+	const shardSize = 16 * 1024 * 1024 // 16MB
 
 	fileInfo, err := os.Stat(filename)
 	checkErr(err)
 
 	fileSize := fileInfo.Size()
 
-	if fileSize < minSize {
-		*dataShards = 5
-		*parShards = 3
-	} else {
+	// 1. 데이터 샤드 개수 = ceil(fileSize / 16MB)
+	*dataShards = int(math.Ceil(float64(fileSize) / float64(shardSize))) // 올림 나눗셈
 
-		for fileSize/int64(*dataShards) < minSize && *dataShards > 10 {
-			*dataShards -= 10
-		}
+	// 2. 전체 샤드 개수 = ceil(dataShards * 1.5)
+	totalShards := int(math.Ceil(float64(*dataShards) * 1.5))
 
-		*parShards = *dataShards / 2
-	}
+	// 3. 패리티 샤드 개수 = 전체 샤드 - 데이터 샤드
+	*parShards = totalShards - *dataShards
 }
 
 func DoEncode(fname string, password string) ([]string, []string, int64, int64, int, int) {
@@ -206,6 +205,7 @@ func DoEncode(fname string, password string) ([]string, []string, int64, int64, 
 	fileShard.Close()
 
 	// Encode parity
+
 	err = enc.Encode(input, parity)
 	checkErr(err)
 	fmt.Printf("File split into %d data + %d parity shards.\n", *dataShards, *parShards)
@@ -224,7 +224,6 @@ func DoEncode(fname string, password string) ([]string, []string, int64, int64, 
 	// Remove the Encrypted file
 	err = os.Remove(encFile)
 	checkErr(err)
-
 	return paths, checksums, sizePerShard, padding, *dataShards, *parShards
 }
 
@@ -271,7 +270,7 @@ func trimPadding(f *os.File, trimSize int64) {
 
 func DoDecode(fname string, outfn string, padding int64, confChecksums map[string]string, downloadshard int, downloadparity int, password string) error {
 	// ConfChecksums is the checksums from configfile
-
+	start := time.Now()
 	fname = fmt.Sprintf("%s%s", fname, fileCryptExtension)
 	shardDir, _ := GetShardDir()
 	fmt.Printf("outfn: %s, fname: %s\n", outfn, fname)
@@ -397,7 +396,8 @@ func DoDecode(fname string, outfn string, padding int64, confChecksums map[strin
 	}
 
 	closeInput(shards)
-
+	duration := time.Since(start) // 경과 시간 측정
+	fmt.Printf("DoDecode 실행 소요 시간: %s\n", duration)
 	return nil
 }
 
@@ -1005,10 +1005,10 @@ func (r *rsStream) Split(data io.Reader, dst []io.Writer, size int64) (int64, er
 	}
 
 	// Calculate number of bytes per shard.
-	perShard := (size + int64(r.r.dataShards) - 1) / int64(r.r.dataShards)
-
+	//perShard := (size + int64(r.r.dataShards) - 1) / int64(r.r.dataShards)
+	const perShard = 16 * 1024 * 1024
 	// Calculate padding size.
-	paddingSize := (int64(r.r.totalShards) * perShard) - size
+	paddingSize := (int64(r.r.dataShards) * perShard) - size
 
 	// Create zeroPaddingReader to track padding bytes.
 	paddingReader := &zeroPaddingReader{}
