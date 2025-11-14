@@ -27,6 +27,8 @@ type FileInfo struct {
 	Checksum             string                     `json:"checksum"`
 	Padding              int64                      `json:"padding_amount"`
 	DistributedFileInfos map[string]DistributedFile `json:"distributed_file_infos"`
+
+	RemoteShardCount map[string]int `json:"remote_shard_count"`
 }
 
 type DistributedFile struct {
@@ -87,13 +89,11 @@ func maxSpeed(history []float64) float64 {
 	if len(history) == 0 {
 		return 0
 	}
-	max := history[0]
+	sum := 0.0
 	for _, speed := range history {
-		if speed > max {
-			max = speed
-		}
+		sum += speed
 	}
-	return max
+	return sum / float64(len(history))
 }
 
 func (distributionFile *DistributedFile) AllocateRemote(loadbalancer LoadBalancerType) error {
@@ -109,6 +109,8 @@ func (distributionFile *DistributedFile) AllocateRemote(loadbalancer LoadBalance
 		remote, err = LoadBalancer_UploadOptima()
 	case ResourceBased:
 		remote, err = LoadBalancer_ResourceBased()
+	case StaticQuota:
+		remote, err = LoadBalancer_StaticQuota()
 	default:
 		remote, err = LoadBalancer_RoundRobin()
 	}

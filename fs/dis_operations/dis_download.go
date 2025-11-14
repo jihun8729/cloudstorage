@@ -3,10 +3,10 @@ package dis_operations
 import (
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -69,7 +69,7 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 		}
 	}
 	if mode == "optimize" {
-		fmt.Println("🚀 Optimization mode: Pre-planned optimal download enabled")
+		fmt.Println("Optimization mode: Pre-planned optimal download enabled")
 
 		fileInfo, err := GetFileInfoStruct(originalFileName)
 		if err != nil {
@@ -105,11 +105,11 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 
 		// ④ 최적 분배 계산
 		optimalPlan := findOptimalDownloadPlan(avgDown, normalizedOwned, dataShards, 16.0)
-		fmt.Printf("📊 Optimal Download Plan: %v\n", optimalPlan)
+		fmt.Printf("Optimal Download Plan: %v\n", optimalPlan)
 
 		// ⑤ plan에 맞는 shard만 선택
 		filtered := selectShardsByPlan(distributedFileInfos, optimalPlan)
-		fmt.Printf("🎯 Applying optimized selection: %d shards retained out of %d\n",
+		fmt.Printf("Applying optimized selection: %d shards retained out of %d\n",
 			len(filtered), len(distributedFileInfos))
 
 		distributedFileInfos = filtered
@@ -175,37 +175,70 @@ type DownloadPlan map[string]int
 
 // findOptimalDownloadPlan - dataShards 개를 각 remote에 어떻게 나눌지 결정
 func findOptimalDownloadPlan(remotes map[string]float64, owned map[string]int, dataShards int, shardSizeMB float64) DownloadPlan {
+	bestPlan := make(DownloadPlan)
+	const eps = 1e-6
+	low := 0.0
+	high := 1e9
+	var bestTime float64
+
 	keys := make([]string, 0, len(remotes))
 	for k := range remotes {
 		keys = append(keys, k)
 	}
+	sort.Strings(keys)
 
-	bestPlan := make(DownloadPlan)
-	bestTime := math.MaxFloat64
+	for high-low > eps {
+		mid := (low + high) / 2
+		sum := 0
+		tempPlan := make(DownloadPlan)
 
-	// 재귀 또는 중첩 for문으로 조합 탐색 (3개 remote 기준)
-	if len(keys) == 3 {
-		a, b, c := keys[0], keys[1], keys[2]
-		for i := 0; i <= owned[a]; i++ {
-			for j := 0; j <= owned[b]; j++ {
-				k := dataShards - i - j
-				if k < 0 || k > owned[c] {
-					continue
-				}
-				tA := (float64(i) * shardSizeMB * 8) / remotes[a]
-				tB := (float64(j) * shardSizeMB * 8) / remotes[b]
-				tC := (float64(k) * shardSizeMB * 8) / remotes[c]
-				makespan := math.Max(tA, math.Max(tB, tC))
-				if makespan < bestTime {
-					bestTime = makespan
-					bestPlan[a] = i
-					bestPlan[b] = j
-					bestPlan[c] = k
-				}
+		for _, k := range keys {
+			capacity := int((mid * remotes[k]) / (shardSizeMB * 8))
+			if capacity > owned[k] {
+				capacity = owned[k]
 			}
+			if capacity < 0 {
+				capacity = 0
+			}
+			tempPlan[k] = capacity
+			sum += capacity
+		}
+
+		if sum >= dataShards {
+			bestTime = mid
+			bestPlan = tempPlan
+			high = mid
+		} else {
+			low = mid
 		}
 	}
-	return bestPlan
+
+	finalPlan := make(DownloadPlan)
+	remain := dataShards
+	type kv struct {
+		key string
+		val float64
+	}
+	var sorted []kv
+	for k, v := range remotes {
+		sorted = append(sorted, kv{k, v})
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].val > sorted[j].val })
+
+	for _, kv := range sorted {
+		if remain <= 0 {
+			break
+		}
+		alloc := bestPlan[kv.key]
+		if alloc > remain {
+			alloc = remain
+		}
+		finalPlan[kv.key] = alloc
+		remain -= alloc
+	}
+
+	fmt.Printf("최소 예상 다운로드 시간: %.3fs\n", bestTime)
+	return finalPlan
 }
 
 func selectShardsByPlan(files []DistributedFile, plan DownloadPlan) []DistributedFile {

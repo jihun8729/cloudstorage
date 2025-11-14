@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -25,13 +27,15 @@ const (
 	DownloadOptima LoadBalancerType = "DownloadOptima"
 	UploadOptima   LoadBalancerType = "UploadOptima"
 	ResourceBased  LoadBalancerType = "ResourceBased"
-	None           LoadBalancerType = "None" // Invalid value
+	// ▼ 새로 추가: 리모트별 동시 작업 개수를 하드코딩으로 제한
+	StaticQuota LoadBalancerType = "StaticQuota"
+	None        LoadBalancerType = "None" // Invalid value
 )
 
 // Validate the input for load balancer
 func (lb LoadBalancerType) IsValid() bool {
 	switch lb {
-	case RoundRobin, DownloadOptima, UploadOptima, ResourceBased:
+	case RoundRobin, DownloadOptima, UploadOptima, ResourceBased, StaticQuota:
 		return true
 	default:
 		return false
@@ -402,4 +406,185 @@ func getFreeStorage(f fs.Fs) (int64, error) {
 
 func GetLBFileName() string {
 	return lb_file_name
+}
+
+var (
+	shardPlan   map[string]int
+	shardRemain map[string]int
+	shardMu     sync.Mutex
+	shardRR     int
+)
+
+func weightedBaseDistribution(up map[string]float64, dn map[string]float64, dataShards int) map[string]int {
+	weights := make(map[string]float64)
+	for k := range up {
+		invSum := (1.0 / up[k]) + (1.0 / dn[k])
+		weights[k] = 1.0 / invSum
+	}
+
+	total := 0.0
+	for _, v := range weights {
+		total += v
+	}
+
+	dist := make(map[string]int)
+	for k, v := range weights {
+		dist[k] = int(math.Round((v / total) * float64(dataShards)))
+	}
+
+	// 합계 보정
+	diff := dataShards - sumInt(dist)
+	if diff != 0 {
+		fastest := maxKey(up)
+		dist[fastest] += diff
+	}
+	return dist
+}
+func expandWithParity(baseDist map[string]int, up map[string]float64, parityShards int, shardSizeMB float64, baseUp float64) map[string]int {
+	dist := copyMap(baseDist)
+	if parityShards <= 0 {
+		return dist
+	}
+
+	for i := 0; i < parityShards; i++ {
+		type candidate struct {
+			key     string
+			newUp   float64
+			upDelta float64
+		}
+		var valid []candidate
+		var fallback []candidate
+
+		for k := range dist {
+			trial := copyMap(dist)
+			trial[k]++
+			newUp := uploadMakespan(trial, up, shardSizeMB)
+			delta := newUp - baseUp
+			if newUp <= baseUp+1e-9 {
+				valid = append(valid, candidate{k, newUp, delta})
+			} else {
+				fallback = append(fallback, candidate{k, newUp, delta})
+			}
+		}
+
+		if len(valid) > 0 {
+			sort.Slice(valid, func(i, j int) bool { return valid[i].newUp < valid[j].newUp })
+			dist[valid[0].key]++
+		} else {
+			sort.Slice(fallback, func(i, j int) bool { return fallback[i].upDelta < fallback[j].upDelta })
+			dist[fallback[0].key]++
+			baseUp = uploadMakespan(dist, up, shardSizeMB)
+		}
+	}
+	return dist
+}
+func uploadMakespan(dist map[string]int, up map[string]float64, shardSizeMB float64) float64 {
+	maxTime := 0.0
+	for k, v := range dist {
+		t := (shardSizeMB * float64(v) * 8.0) / up[k]
+		if t > maxTime {
+			maxTime = t
+		}
+	}
+	return maxTime
+}
+
+func copyMap(m map[string]int) map[string]int {
+	cp := make(map[string]int)
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+func sumInt(m map[string]int) int {
+	s := 0
+	for _, v := range m {
+		s += v
+	}
+	return s
+}
+
+func maxKey(m map[string]float64) string {
+	maxK := ""
+	maxV := -1.0
+	for k, v := range m {
+		if v > maxV {
+			maxV = v
+			maxK = k
+		}
+	}
+	return maxK
+}
+
+func ComputeShardDistribution(dataShards int, parityShards int) error {
+	// lbInfo 불러오기
+	jsonFilePath := getLoadBalancerJsonFilePath()
+	lbInfo, err := readJSON(jsonFilePath)
+	if err != nil {
+		return err
+	}
+
+	// 업로드/다운로드 평균속도 맵 생성
+	up := make(map[string]float64)
+	dn := make(map[string]float64)
+	for k, info := range lbInfo.RemoteInfos {
+		up[k] = info.AvgUpThroughput
+		dn[k] = info.AvgDownThroughput // ❗ lbInfo.RemoteInfos에 추가 필요
+	}
+
+	// Base 분배 (dataShards만 사용)
+	baseDist := weightedBaseDistribution(up, dn, dataShards)
+	fmt.Println("Base distribution:", baseDist)
+
+	// Base makespan 계산
+	baseUp := uploadMakespan(baseDist, up, 16.0)
+
+	//  parityShards를 makespan 유지 조건으로 brute-force 추가
+	finalDist := expandWithParity(baseDist, up, parityShards, 16.0, baseUp)
+
+	// 결과 저장
+	shardPlan = finalDist
+	shardRemain = copyMap(finalDist)
+
+	fmt.Println("Shard distribution plan (Data:", dataShards, "Parity:", parityShards, ")")
+	for k, v := range shardPlan {
+		fmt.Printf("  %s -> %d shards\n", k, v)
+	}
+	fmt.Printf("   ⏱️ Upload makespan: %.2fs\n", uploadMakespan(shardPlan, up, 16.0))
+
+	return nil
+}
+
+func LoadBalancer_StaticQuota() (Remote, error) {
+	shardMu.Lock()
+	defer shardMu.Unlock()
+
+	if len(shardRemain) == 0 {
+		return Remote{}, fmt.Errorf("no shard plan initialized")
+	}
+
+	// 라운드로빈 돌면서 남은 shard 있는 remote 찾기
+	keys := make([]string, 0, len(shardRemain))
+	for k := range shardRemain {
+		keys = append(keys, k)
+	}
+
+	n := len(keys)
+	for i := 0; i < n; i++ {
+		idx := (shardRR + i) % n
+		key := keys[idx]
+		if shardRemain[key] > 0 {
+			shardRemain[key]--
+			shardRR = (idx + 1) % n
+
+			parts := strings.Split(key, "|")
+			if len(parts) != 2 {
+				return Remote{}, fmt.Errorf("invalid key format: %s", key)
+			}
+			return Remote{Name: parts[0], Type: parts[1]}, nil
+		}
+	}
+
+	return Remote{}, fmt.Errorf("all shard quotas exhausted")
 }

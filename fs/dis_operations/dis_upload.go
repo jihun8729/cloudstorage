@@ -94,6 +94,7 @@ func Dis_Upload(args []string, reSignal bool, loadBalancer LoadBalancerType) err
 		if err != nil {
 			return err
 		}
+
 	}
 
 	start := time.Now()
@@ -138,9 +139,24 @@ func createHashNames(distributedFileArray []DistributedFile) (hashNameMap map[st
 }
 
 func prepareUpload(absolutePath string) (hashNameMap map[string]string, distributedFileInfos []DistributedFile, err error) {
+	start := time.Now()
 	dis_names, checksums, shardSize, padding, shard, parity := reedsolomon.DoEncode(absolutePath, tryGetPassword())
+	duration := time.Since(start) // 경과 시간 측정
+	fmt.Printf("DoEncode 실행 시간: %s\n", duration)
+
+	// 로그 파일 저장
+	// logFile := "C:\\Users\\jeff8\\Desktop\\encode_logs.txt"
+	// f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// if err == nil {
+	// 	defer f.Close()
+	// 	logLine := fmt.Sprintf("%s\n", duration)
+	// 	f.WriteString(logLine)
+	// } else {
+	// 	fmt.Println("로그 파일 저장 실패:", err)
+	// }
 	fmt.Println("Shard:", shard)
 	fmt.Println("Parity:", parity)
+
 	remotes := config.GetRemotes()
 
 	err = MakeDistributionDir(remotes)
@@ -171,6 +187,25 @@ func prepareUpload(absolutePath string) (hashNameMap map[string]string, distribu
 	if err != nil {
 		return nil, nil, err
 	}
+	err = ComputeShardDistribution(shard, parity)
+	if err != nil {
+		return nil, nil, err
+	}
+	fileInfo, err := GetFileInfoStruct(filepath.Base(absolutePath))
+	if err == nil {
+		if fileInfo.RemoteShardCount == nil {
+			fileInfo.RemoteShardCount = make(map[string]int)
+		}
+		for remoteKey, count := range shardPlan {
+			fileInfo.RemoteShardCount[remoteKey] = count
+		}
+
+		filesMap, err := readJsonFile()
+		if err == nil {
+			filesMap[fileInfo.FileName] = fileInfo
+			_ = writeJsonFile(getJsonFilePath(), filesMap)
+		}
+	}
 
 	return hashNameMap, distributedFileInfos, nil
 }
@@ -199,16 +234,16 @@ func uploadFile(source, dest string, mu *sync.Mutex, totalThroughput *float64, f
 
 	// Calculate throughput
 	throughput := float64(fileSize) / elapsedTime.Seconds()
-	throughputKbps := throughput * 8 / 1e3
+	throughputMbps := throughput * 8 / 1e6
 
 	// Update throughput and file count
 	mu.Lock()
-	*totalThroughput += throughputKbps
+	*totalThroughput += throughputMbps
 	*fileCount++
 	mu.Unlock()
 
 	// Update remote info
-	err = updateRemoteInfo_Up(originalFileName, shardInfo, throughputKbps, mu)
+	err = updateRemoteInfo_Up(originalFileName, shardInfo, throughputMbps, mu)
 	if err != nil {
 		return err
 	}
@@ -221,7 +256,7 @@ func uploadFile(source, dest string, mu *sync.Mutex, totalThroughput *float64, f
 	return nil
 }
 
-func updateRemoteInfo_Up(originalFileName string, shardInfo DistributedFile, throughputKbps float64, mu *sync.Mutex) error {
+func updateRemoteInfo_Up(originalFileName string, shardInfo DistributedFile, throughputMbps float64, mu *sync.Mutex) error {
 	mu.Lock()
 	err := UpdateDistributedFile_CheckFlagAndRemote(originalFileName, shardInfo.DistributedFile, true, shardInfo.Remote)
 	if err != nil {
@@ -229,7 +264,7 @@ func updateRemoteInfo_Up(originalFileName string, shardInfo DistributedFile, thr
 		return fmt.Errorf("UpdateDistributedFileCheckFlag error: %v", err)
 	}
 	err = UpdateRemoteInfo(shardInfo.Remote, func(b *RemoteInfo) {
-		b.UpdateThroughput(throughputKbps, 0)
+		b.UpdateThroughput(throughputMbps, 0)
 	})
 	mu.Unlock()
 	if err != nil {
@@ -253,6 +288,7 @@ func startUploadFileGoroutine_Worker(originalFileName string, hashedFileNameMap 
 		for shardInfo := range jobs {
 			// Allocate Remote
 			mu.Lock()
+			fmt.Printf("Allocate\n")
 			err := shardInfo.AllocateRemote(loadBalancer)
 			mu.Unlock()
 			if err != nil {
@@ -295,60 +331,7 @@ func startUploadFileGoroutine_Worker(originalFileName string, hashedFileNameMap 
 	wg.Wait()   // Wait for all workers to finish
 
 	averageThroughput := totalThroughput / float64(fileCount)
-	fmt.Printf("Average Throughput: %f Kbps\n", averageThroughput)
-	fmt.Println("Current Time:", time.Now().Format("2006-01-02 15:04:05"))
-
-	if len(errs) > 0 {
-		return fmt.Errorf("errors occurred: %v", errs)
-	}
-	return nil
-}
-
-func startUploadFileGoroutine(originalFileName string, hashedFileNameMap map[string]string, distributedFileArray []DistributedFile, loadBalancer LoadBalancerType) (err error) {
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	var errs []error
-	dir := GetShardPath()
-
-	var totalThroughput float64 // Accumulates total throughput
-	var fileCount int           // Counts number of uploaded files
-
-	for _, shardInfo := range distributedFileArray {
-		wg.Add(1)
-
-		go func(shardInfo DistributedFile, loadBalancer LoadBalancerType) {
-			defer wg.Done()
-
-			// Allocate Remote
-			mu.Lock()
-			err := shardInfo.AllocateRemote(loadBalancer)
-			mu.Unlock()
-			if err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-				return
-			}
-
-			dest := fmt.Sprintf("%s:%s", shardInfo.Remote.Name, remoteDirectory)
-			source := filepath.Join(dir, hashedFileNameMap[shardInfo.DistributedFile])
-
-			// Upload file and calculate throughput
-			err = uploadFile(source, dest, &mu, &totalThroughput, &fileCount, &errs, originalFileName, shardInfo, hashedFileNameMap)
-			if err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-			}
-
-		}(shardInfo, loadBalancer)
-	}
-
-	wg.Wait()
-
-	averageThroughput := totalThroughput / float64(fileCount)
-
-	fmt.Printf("Average Throughput: %f Kbps\n", averageThroughput)
+	fmt.Printf("Average Throughput: %f Mbps\n", averageThroughput)
 	fmt.Println("Current Time:", time.Now().Format("2006-01-02 15:04:05"))
 
 	if len(errs) > 0 {
@@ -358,6 +341,7 @@ func startUploadFileGoroutine(originalFileName string, hashedFileNameMap map[str
 }
 
 func MakeDistributionDir(remotes []config.Remote) (err error) {
+	check := time.Now()
 	var wg sync.WaitGroup
 	var errs []error
 	for _, remote := range remotes {
@@ -380,6 +364,8 @@ func MakeDistributionDir(remotes []config.Remote) (err error) {
 	if len(errs) > 0 {
 		return fmt.Errorf("errors occurred: %v", errs)
 	}
+	duration := time.Since(check) // 경과 시간 측정
+	fmt.Printf("MakeDistributionDir 실행 시간: %s\n", duration)
 
 	return nil
 }
