@@ -99,7 +99,7 @@ func Dis_Upload(args []string, reSignal bool, loadBalancer LoadBalancerType) err
 
 	start := time.Now()
 
-	if err := startUploadFileGoroutine_Worker(originalFileName, hashedNamesMap, distributedFileArray, loadBalancer, 32); err != nil {
+	if err := startUploadFileGoroutine_Worker(originalFileName, hashedNamesMap, distributedFileArray, loadBalancer, 3); err != nil {
 		return err
 	}
 
@@ -139,7 +139,15 @@ func createHashNames(distributedFileArray []DistributedFile) (hashNameMap map[st
 }
 
 func prepareUpload(absolutePath string) (hashNameMap map[string]string, distributedFileInfos []DistributedFile, err error) {
+	// fileStat, err := os.Stat(absolutePath)
+	// if err != nil {
+	// 	return nil, nil, err
+	// }
 	start := time.Now()
+	// datashard, parityshard := variable_coderate_plan(fileStat.Size())
+	// fmt.Printf("Datashard : %d, ParityShard : %d\n", datashard, parityshard)
+
+	//dis_names, checksums, shardSize, padding, shard, parity := reedsolomon.DoEncode(absolutePath, tryGetPassword(), datashard, parityshard)
 	dis_names, checksums, shardSize, padding, shard, parity := reedsolomon.DoEncode(absolutePath, tryGetPassword())
 	duration := time.Since(start) // 경과 시간 측정
 	fmt.Printf("DoEncode 실행 시간: %s\n", duration)
