@@ -13,7 +13,7 @@ func init() {
 }
 
 var commandDefinition = &cobra.Command{
-	Use:   "dis_download target:name destination:path",
+	Use:   "dis_download target:name destination:path [mode]",
 	Short: `Download distributed file to destination path.`,
 	Long: strings.ReplaceAll(
 		`Download distributed file to destination path. Target file must be
@@ -22,6 +22,7 @@ requested in full name, meaning that it must be followed with its extension.
 eg
 
 	rclone dis_download test.txt local:path
+	rclone dis_download test.txt local:path optimize
 
 
 Note that during this process, distributed binary files stored remote will be 
@@ -40,7 +41,7 @@ To erase the files, use the dis_rm command instead.
 		"groups": "Copy,Filter,Listing,Important",
 	},
 	Run: func(command *cobra.Command, args []string) {
-		cmd.CheckArgs(2, 2, command, args)
+		cmd.CheckArgs(2, 3, command, args)
 		cmd.Run(true, true, command, func() error {
 			sameCommand, err := dis_operations.CheckState("download", args, dis_operations.None) // use default lb, its not going to be used anyways
 			if err != nil {
