@@ -99,7 +99,7 @@ func Dis_Upload(args []string, reSignal bool, loadBalancer LoadBalancerType) err
 
 	start := time.Now()
 
-	if err := startUploadFileGoroutine_Worker(originalFileName, hashedNamesMap, distributedFileArray, loadBalancer, 3); err != nil {
+	if err := startUploadFileGoroutine_Worker(originalFileName, hashedNamesMap, distributedFileArray, loadBalancer, 8); err != nil {
 		return err
 	}
 
@@ -108,10 +108,10 @@ func Dis_Upload(args []string, reSignal bool, loadBalancer LoadBalancerType) err
 	if err != nil {
 		return err
 	}
-	throughput := float64(fileInfo.Size()) / elapsed.Seconds() / (1024 * 1024) // MB/s
+	throughput := float64(fileInfo.Size()) / elapsed.Seconds() / (1024 * 1024) * 8// Mbps
 	currentTime := time.Now().Format("2006-01-02 15:04:05")
 
-	fmt.Printf("Time taken for copy cmd: %s, Throughput: %.2f MB/s, Current Time: %s\n",
+	fmt.Printf("Time taken for copy cmd: %s, Throughput: %.2f Mbps, Current Time: %s\n",
 		elapsed, throughput, currentTime)
 
 	if err := ResetCheckFlag(originalFileName); err != nil {
@@ -195,10 +195,10 @@ func prepareUpload(absolutePath string) (hashNameMap map[string]string, distribu
 	if err != nil {
 		return nil, nil, err
 	}
-	err = ComputeShardDistribution(shard, parity)
-	if err != nil {
-		return nil, nil, err
-	}
+	// err = ComputeShardDistribution(shard, parity)
+	// if err != nil {
+	// 	return nil, nil, err
+	// }
 	fileInfo, err := GetFileInfoStruct(filepath.Base(absolutePath))
 	if err == nil {
 		if fileInfo.RemoteShardCount == nil {
