@@ -10,12 +10,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"sync/atomic"
 
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/reedsolomon"
 	"github.com/spf13/cobra"
 )
+
+var downloadedCount int64
 
 var copyCommandDefinitionForDown = &cobra.Command{
 	Use: "copy source:path dest:path",
@@ -47,6 +50,14 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 	if err != nil {
 		return err
 	}
+	fileInfo, err := GetFileInfoStruct(originalFileName)
+	
+	if err != nil {
+		return err
+	}
+	// ① datamap.json 정보
+	dataShards := fileInfo.Shard
+	remoteShardCount := fileInfo.RemoteShardCount
 
 	var distributedFileInfos []DistributedFile
 
@@ -67,19 +78,18 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 		if err != nil {
 			return err
 		}
+		RRplan := makeRRPlan(dataShards)
+
+		selected := selectShardsByPlan(distributedFileInfos, RRplan)
+		distributedFileInfos = selected
+		fmt.Println("[RR DOWNLOAD PLAN]")
+		for remote, cnt := range RRplan {
+			fmt.Printf("  %s: %d shards\n", remote, cnt)
+		}
+
 	}
 	if mode == "optimize" {
 		fmt.Println("Optimization mode: Pre-planned optimal download enabled")
-
-		fileInfo, err := GetFileInfoStruct(originalFileName)
-		if err != nil {
-			return err
-		}
-
-		// ① datamap.json 정보
-		dataShards := fileInfo.Shard
-		remoteShardCount := fileInfo.RemoteShardCount
-
 		// ② loadbalancer.json 정보
 		jsonFilePath := getLoadBalancerJsonFilePath()
 		lbInfo, err := readJSON(jsonFilePath)
@@ -117,7 +127,7 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 	}
 
 	start := time.Now()
-	if err := startDownloadFileGoroutine_Worker(distributedFileInfos, originalFileName, 32); err != nil {
+	if err := startDownloadFileGoroutine_Worker(distributedFileInfos, originalFileName, 8); err != nil {
 		return err
 	}
 
@@ -131,16 +141,16 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 	}
 
 	// Move downloaded file to destination
-	fileInfo, err := GetFileInfoStruct(originalFileName)
-	if err != nil {
-		return err
-	}
+	// fileInfo, err := GetFileInfoStruct(originalFileName)
+	// if err != nil {
+	// 	return err
+	// }
 
 	checksums := make(map[string]string)
 	for _, each := range distributedFileInfos {
 		checksums[each.DistributedFile] = each.Checksum
 	}
-
+	
 	err = reedsolomon.DoDecode(originalFileName, absolutePath, fileInfo.Padding, checksums, fileInfo.Shard, fileInfo.Parity, tryGetPassword())
 	if err != nil {
 		result := ShowDescription_RemoveFile(originalFileName, err)
@@ -152,7 +162,7 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 		}
 		return nil
 	}
-
+	
 	// change Flag and Check to false
 	err = ResetCheckFlag(args[0])
 	if err != nil {
@@ -167,11 +177,43 @@ func Dis_Download(args []string, reSignal bool) (err error) {
 	}
 
 	reedsolomon.DeleteShardWithFileNames(distributedFiles)
-
+	fmt.Printf("Time taken for dis_download: %s\n", elapsed)
 	return nil
 }
 
 type DownloadPlan map[string]int
+
+func makeRRPlan(dataShards int) DownloadPlan {
+	RRplan := make(DownloadPlan)
+
+	// hard-coded remote names
+	remotes := []string{
+		"gdrive",
+		"onedrive",
+		"mega",
+	}
+
+	numRemotes := 3
+
+	// ceil(dataShards / 3)
+	perRemote := (dataShards + numRemotes - 1) / numRemotes
+
+	total := 0
+	for _, remote := range remotes {
+		RRplan[remote] = perRemote
+		total += perRemote
+	}
+
+	if total < dataShards {
+		panic(fmt.Sprintf(
+			"[RR DOWNLOAD ERROR] total shards %d < dataShards %d",
+			total, dataShards,
+		))
+	}
+
+	return RRplan
+}
+
 
 // findOptimalDownloadPlan - dataShards 개를 각 remote에 어떻게 나눌지 결정
 func findOptimalDownloadPlan(remotes map[string]float64, owned map[string]int, dataShards int, shardSizeMB float64) DownloadPlan {
@@ -298,6 +340,11 @@ func startDownloadFileGoroutine_Worker(distributedFileInfos []DistributedFile, o
 
 	close(jobs) // Close channel to signal workers
 	wg.Wait()   // Wait for all workers to finish
+	fmt.Printf(
+		"[DOWNLOAD RESULT] completed shards: %d / requested shards: %d\n",
+		atomic.LoadInt64(&downloadedCount),
+		len(distributedFileInfos),
+	)
 
 	return nil
 }
@@ -346,7 +393,7 @@ func downloadFile(fileInfo DistributedFile, shardDir, originalFileName string, m
 	if err != nil {
 		return err
 	}
-
+	atomic.AddInt64(&downloadedCount, 1)
 	return nil
 }
 
