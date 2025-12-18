@@ -556,6 +556,153 @@ func ComputeShardDistribution(dataShards int, parityShards int) error {
 	return nil
 }
 
+func combinations2(keys []string) [][]string {
+	var res [][]string
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			res = append(res, []string{keys[i], keys[j]})
+		}
+	}
+	return res
+}
+
+func isRecoverable(plan map[string]int, dataShards int, storages []string) bool {
+	combos := combinations2(storages)
+	for _, combo := range combos {
+		total := plan[combo[0]] + plan[combo[1]]
+		if total < dataShards {
+			return false
+		}
+	}
+	return true
+}
+
+func unrecoveredCombos(plan map[string]int, dataShards int, storages []string) [][]string {
+	var res [][]string
+	combos := combinations2(storages)
+	for _, combo := range combos {
+		total := plan[combo[0]] + plan[combo[1]]
+		if total < dataShards {
+			res = append(res, combo)
+		}
+	}
+	return res
+}
+
+func variable_coderate_plan(fileSize int64) (int, int) {
+
+	dataShards := int(math.Ceil(float64(fileSize) / (16 * 1024 * 1024)))
+
+	// --- LB 정보 로드 ---
+	jsonFilePath := getLoadBalancerJsonFilePath()
+	lbInfo, _ := readJSON(jsonFilePath)
+
+	up := make(map[string]float64)
+	dn := make(map[string]float64)
+	var storages []string
+	for k, info := range lbInfo.RemoteInfos {
+		storages = append(storages, k)
+		up[k] = info.AvgUpThroughput
+		dn[k] = info.AvgDownThroughput
+	}
+
+	// --- Base ---
+	baseDist := weightedBaseDistribution(up, dn, dataShards)
+
+	fmt.Println("Base distribution:", baseDist)
+
+	// --- Parity 추가 ---
+	parity := 0
+	plan := copyMap(baseDist)
+
+	for {
+		if isRecoverable(plan, dataShards, storages) {
+			break
+		}
+
+		parity++
+		baseTime := uploadMakespan(plan, up, 16.0)
+
+		combos := unrecoveredCombos(plan, dataShards, storages)
+
+		bestDelta := math.MaxFloat64
+		var bestStorage string
+
+		for _, combo := range combos {
+			s1, s2 := combo[0], combo[1]
+
+			for _, target := range []string{s1, s2} {
+				trial := copyMap(plan)
+				trial[target]++
+
+				newTime := uploadMakespan(trial, up, 16.0)
+				delta := newTime - baseTime
+
+				if delta < bestDelta {
+					bestDelta = delta
+					bestStorage = target
+				}
+			}
+		}
+
+		plan[bestStorage]++
+		fmt.Printf("Parity %d added to %s (Δmakespan=%.4fs)\n", parity, bestStorage, bestDelta)
+	}
+
+	shardPlan = plan
+	shardRemain = copyMap(plan)
+
+	fmt.Printf("\nShard distribution plan (Data: %d, Parity: %d)\n", dataShards, parity)
+
+	for k, v := range shardPlan {
+		fmt.Printf("  %s -> %d shards\n", k, v)
+	}
+
+	fmt.Printf("   ⏱️ Upload prediction time: %.2fs\n", simulateUpload(up, shardPlan))
+
+	return dataShards, parity
+}
+
+func ShardUploadTime(tp float64) float64 {
+	return (16.0 * 8.0) / tp
+}
+
+// goroutine 업로드 시뮬레이션
+func simulateUpload(throughput map[string]float64, plan map[string]int) float64 {
+	// worker 8개 타임라인 초기화
+	workerEnd := make([]float64, 8)
+
+	// 각 remote에 대해 shard 개수만큼 worker 스케줄링
+	for remote, cnt := range plan {
+		tPerShard := ShardUploadTime(throughput[remote])
+
+		for i := 0; i < cnt; i++ {
+			// 가장 빨리 끝나는 worker 찾기
+			minIdx := 0
+			minVal := workerEnd[0]
+
+			for w := 1; w < 8; w++ {
+				if workerEnd[w] < minVal {
+					minVal = workerEnd[w]
+					minIdx = w
+				}
+			}
+
+			// 해당 worker에 shard 하나 추가
+			workerEnd[minIdx] += tPerShard
+		}
+	}
+
+	// 가장 오래 걸린 worker가 makespan
+	makespan := 0.0
+	for _, t := range workerEnd {
+		if t > makespan {
+			makespan = t
+		}
+	}
+	return makespan
+}
+
 func LoadBalancer_StaticQuota() (Remote, error) {
 	shardMu.Lock()
 	defer shardMu.Unlock()
